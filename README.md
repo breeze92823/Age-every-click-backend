@@ -53,7 +53,8 @@ persisted.
 | `move` | `{ x, y, z, yaw, moveBlend }` | throttled, not per physics frame |
 | `setAvatar` | `{ avatar }` (JSON string, same shape `systems/avatarLoader.js` consumes) | on connect + whenever the portal reports the avatar changed |
 | `stats` | `{ speed, coins, rebirth }` | debounced on change |
-| `saveProgress` | `{ speed, rebirth, coins, ownedHexPads, equippedHexPad, ownedAuras, equippedAura, ownedAgeMachines }` | debounced on change; no-ops for a guest (no `userId`) |
+| `saveProgress` | `{ speed, rebirth, coins, ownedHexPads, equippedHexPad, ownedAuras, equippedAura, ownedAgeMachines, spins, speedCoil, wheelSpins }` | debounced on change; no-ops for a guest (no `userId`) |
+| `claimFreeSpin` | `{}` | Lucky Wheel's daily free spin; the 24h cooldown is checked and stamped on the server clock |
 | `identify` | `{ username, userId }` | whenever sign-in state changes after join |
 
 `speed` is Age's raw click-earned total (client `data/progression.js`), the
@@ -64,7 +65,8 @@ with `PLAYER_MOVE_SPEED`.
 
 | Message | Payload | When |
 |---|---|---|
-| `progress` | full saved `PlayerDoc` (see `src/db.ts`) | once, right after a signed-in join/identify, if a saved doc exists |
+| `progress` | saved `PlayerDoc` fields (see `src/db.ts`), plus `freeSpinInMs` (time left on the free-spin cooldown) | once, right after a signed-in join/identify, if a saved doc exists |
+| `freeSpin` | `{ ok, nextInMs, reason? }` — `reason` is `cooldown`, `unavailable` (guest / no Mongo: client falls back to a local timer) or `error` | reply to `claimFreeSpin` |
 | `leaderboard` | `{ speed: Row[], coins: Row[], rebirth: Row[] }`, `Row = { id, name, value }` | every 15s, merging the live roster with all-time Mongo top scorers |
 
 `IslandState.players` (keyed by `sessionId`) carries `username`, `x/y/z/yaw`,

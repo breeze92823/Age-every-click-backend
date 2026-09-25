@@ -1,6 +1,6 @@
 import { Room, Client, CloseCode } from "colyseus";
 import { IslandState, PlayerState } from "./schema/IslandState.js";
-import { LEADERBOARD_REFRESH_MS, LEADERBOARD_QUERY_LIMIT } from "../constants.js";
+import { LEADERBOARD_REFRESH_MS, LEADERBOARD_QUERY_LIMIT, FREE_SPIN_INTERVAL_MS, SPINS_MAX } from "../constants.js";
 import { getPlayers, type PlayerDoc } from "../db.js";
 
 // The 3 stats client store/useGameStore.js tracks and an in-world
@@ -67,6 +67,11 @@ function sanitizeProgress(raw: unknown): Partial<PlayerDoc> | null {
         .slice(0, OWNED_LIST_MAX);
     }
   }
+  for (const key of ["spins", "wheelSpins"] as const) {
+    const v = src[key];
+    if (typeof v === "number" && Number.isFinite(v)) out[key] = Math.min(SPINS_MAX, Math.max(0, Math.floor(v)));
+  }
+  if (typeof src.speedCoil === "boolean") out.speedCoil = src.speedCoil;
   if (typeof src.equippedHexPad === "number" && Number.isFinite(src.equippedHexPad)) {
     out.equippedHexPad = src.equippedHexPad;
   }
@@ -90,6 +95,10 @@ export class IslandRoom extends Room<{ state: IslandState }> {
   // no reason to be broadcast to other players, it only gates this room's own
   // Mongo reads/writes for the owning connection.
   userIds = new Map<string, string>();
+
+  // userIds with a `claimFreeSpin` read-check-write already in flight, so a
+  // double-click can't pass the cooldown check twice before the first write lands.
+  private claimingFreeSpin = new Set<string>();
 
   messages = {
     // Throttled client-side -- not sent every physics frame.
@@ -159,6 +168,44 @@ export class IslandRoom extends Room<{ state: IslandState }> {
         );
       } catch (err) {
         console.warn("[IslandRoom] saveProgress failed", err);
+      }
+    },
+    // Lucky Wheel's daily free spin. The cooldown is checked and stamped here,
+    // on the server clock, and saved outside saveProgress (which can't touch
+    // lastFreeSpinAt), so neither a wrong device clock nor a forged save can
+    // skip it. Replies `freeSpin` { ok, nextInMs, reason? } -- nextInMs is a
+    // duration rather than a timestamp so client clock skew doesn't matter.
+    // reason "unavailable" = guest or Mongo down: nothing durable to check
+    // against, so the client falls back to its own local timer.
+    claimFreeSpin: async (client: Client) => {
+      const userId = this.userIds.get(client.sessionId);
+      const players = getPlayers();
+      if (!userId || !players) {
+        client.send("freeSpin", { ok: false, reason: "unavailable", nextInMs: 0 });
+        return;
+      }
+      if (this.claimingFreeSpin.has(userId)) return;
+      this.claimingFreeSpin.add(userId);
+      try {
+        const now = Date.now();
+        const doc = await players.findOne({ _id: userId });
+        const remaining = Math.min(FREE_SPIN_INTERVAL_MS, (doc?.lastFreeSpinAt ?? 0) + FREE_SPIN_INTERVAL_MS - now);
+        if (remaining > 0) {
+          client.send("freeSpin", { ok: false, reason: "cooldown", nextInMs: remaining });
+          return;
+        }
+        const p = this.state.players.get(client.sessionId);
+        await players.updateOne(
+          { _id: userId },
+          { $set: { lastFreeSpinAt: now, username: p?.username || "Player", updatedAt: new Date() }, $setOnInsert: { version: 1 } },
+          { upsert: true },
+        );
+        client.send("freeSpin", { ok: true, nextInMs: FREE_SPIN_INTERVAL_MS });
+      } catch (err) {
+        console.warn("[IslandRoom] claimFreeSpin failed", err);
+        client.send("freeSpin", { ok: false, reason: "error", nextInMs: 0 });
+      } finally {
+        this.claimingFreeSpin.delete(userId);
       }
     },
     // Re-states this connection's identity after a login/logout/account
@@ -281,6 +328,11 @@ export class IslandRoom extends Room<{ state: IslandState }> {
         ownedAuras: doc.ownedAuras ?? [],
         equippedAura: doc.equippedAura ?? null,
         ownedAgeMachines: doc.ownedAgeMachines ?? [],
+        spins: doc.spins ?? 0,
+        speedCoil: doc.speedCoil ?? false,
+        wheelSpins: doc.wheelSpins ?? 0,
+        // Time left on the free-spin cooldown, as a duration (see claimFreeSpin).
+        freeSpinInMs: Math.max(0, Math.min(FREE_SPIN_INTERVAL_MS, (doc.lastFreeSpinAt ?? 0) + FREE_SPIN_INTERVAL_MS - Date.now())),
       });
     } catch (err) {
       console.warn("[IslandRoom] loadProgress failed", err);

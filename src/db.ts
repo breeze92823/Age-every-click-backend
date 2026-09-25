@@ -25,6 +25,16 @@ export interface PlayerDoc {
   equippedAura: number | null;
   // Indices into client data/island.js's AGE_MACHINES.tiers that the player owns.
   ownedAgeMachines: number[];
+  // Lucky Wheel (client data/luckyWheel.js): unspent spins, whether the
+  // permanent x2 click-gain prize is owned, and how many spins the account has
+  // ever done (the very first one rolls a friendlier prize table). Older docs
+  // simply lack these -- every reader defaults them.
+  spins?: number;
+  speedCoil?: boolean;
+  wheelSpins?: number;
+  // Server epoch ms of the last free-spin claim. Only ever written by
+  // IslandRoom.ts's `claimFreeSpin`, never by saveProgress.
+  lastFreeSpinAt?: number;
   version: number;
   updatedAt: Date;
 }
