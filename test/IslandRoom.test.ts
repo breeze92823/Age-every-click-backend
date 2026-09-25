@@ -333,4 +333,69 @@ describe("testing your Colyseus app", () => {
         payload.rebirth.findIndex((r: any) => r.name === "Newbie"),
     );
   });
+
+  // Lucky Wheel persistence: saveProgress must keep the wheel fields, but
+  // lastFreeSpinAt is server-owned and a forged value in the payload is dropped.
+  it("saveProgress persists wheel fields but never lastFreeSpinAt", async () => {
+    const fake = fakePlayersCollection();
+    __setPlayersForTest(fake);
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room, { username: "Zoe", userId: "bloxity-zoe" });
+
+    client1.send("saveProgress", { spins: 3, wheelSpins: 2, speedCoil: true, lastFreeSpinAt: 1 });
+    await room.waitForNextPatch();
+
+    const doc = await fake.findOne({ _id: "bloxity-zoe" } as any);
+    assert.strictEqual(doc?.spins, 3);
+    assert.strictEqual(doc?.wheelSpins, 2);
+    assert.strictEqual(doc?.speedCoil, true);
+    assert.strictEqual(doc?.lastFreeSpinAt, undefined);
+  });
+
+  it("claimFreeSpin grants once, stamps the server clock, then reports the cooldown", async () => {
+    const fake = fakePlayersCollection();
+    __setPlayersForTest(fake);
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room, { username: "Zoe", userId: "bloxity-zoe" });
+
+    const first = client1.waitForMessage("freeSpin");
+    client1.send("claimFreeSpin", {});
+    const firstReply = await first;
+    assert.strictEqual(firstReply.ok, true);
+    assert.strictEqual(firstReply.nextInMs, 24 * 60 * 60 * 1000);
+    const stamped = (await fake.findOne({ _id: "bloxity-zoe" } as any))?.lastFreeSpinAt;
+    assert.ok(typeof stamped === "number" && Math.abs(stamped - Date.now()) < 5000);
+
+    const second = client1.waitForMessage("freeSpin");
+    client1.send("claimFreeSpin", {});
+    const secondReply = await second;
+    assert.strictEqual(secondReply.ok, false);
+    assert.strictEqual(secondReply.reason, "cooldown");
+    assert.ok(secondReply.nextInMs > 0 && secondReply.nextInMs <= 24 * 60 * 60 * 1000);
+  });
+
+  it("claimFreeSpin succeeds again once 24h have passed", async () => {
+    const fake = fakePlayersCollection([
+      { _id: "bloxity-zoe", username: "Zoe", speed: 0, rebirth: 0, coins: 0, ownedHexPads: [0], equippedHexPad: 0, ownedAuras: [], equippedAura: null, ownedAgeMachines: [], lastFreeSpinAt: Date.now() - 25 * 60 * 60 * 1000, version: 1, updatedAt: new Date() },
+    ]);
+    __setPlayersForTest(fake);
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room, { username: "Zoe", userId: "bloxity-zoe" });
+
+    const reply = client1.waitForMessage("freeSpin");
+    client1.send("claimFreeSpin", {});
+    assert.strictEqual((await reply).ok, true);
+  });
+
+  it("claimFreeSpin reports 'unavailable' for a guest so the client can fall back to a local timer", async () => {
+    __setPlayersForTest(fakePlayersCollection());
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const guest = await colyseus.connectTo(room, { username: "Guest" });
+
+    const reply = guest.waitForMessage("freeSpin");
+    guest.send("claimFreeSpin", {});
+    const msg = await reply;
+    assert.strictEqual(msg.ok, false);
+    assert.strictEqual(msg.reason, "unavailable");
+  });
 });
