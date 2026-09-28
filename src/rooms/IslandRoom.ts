@@ -71,6 +71,11 @@ function sanitizeProgress(raw: unknown): Partial<PlayerDoc> | null {
     const v = src[key];
     if (typeof v === "number" && Number.isFinite(v)) out[key] = Math.min(SPINS_MAX, Math.max(0, Math.floor(v)));
   }
+  // No upper bound -- client systems/tutorial.js's own STEPS length may grow,
+  // and a stray large value just reads as "onboarding finished" there anyway.
+  if (typeof src.tutorialStep === "number" && Number.isFinite(src.tutorialStep)) {
+    out.tutorialStep = Math.max(0, Math.floor(src.tutorialStep));
+  }
   if (typeof src.speedCoil === "boolean") out.speedCoil = src.speedCoil;
   if (typeof src.equippedHexPad === "number" && Number.isFinite(src.equippedHexPad)) {
     out.equippedHexPad = src.equippedHexPad;
@@ -331,6 +336,7 @@ export class IslandRoom extends Room<{ state: IslandState }> {
         spins: doc.spins ?? 0,
         speedCoil: doc.speedCoil ?? false,
         wheelSpins: doc.wheelSpins ?? 0,
+        tutorialStep: doc.tutorialStep ?? 0,
         // Time left on the free-spin cooldown, as a duration (see claimFreeSpin).
         freeSpinInMs: Math.max(0, Math.min(FREE_SPIN_INTERVAL_MS, (doc.lastFreeSpinAt ?? 0) + FREE_SPIN_INTERVAL_MS - Date.now())),
       });
