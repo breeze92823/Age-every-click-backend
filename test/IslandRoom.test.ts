@@ -563,6 +563,79 @@ describe("testing your Colyseus app", () => {
     }
   });
 
+  it("defers a due reshuffle while a player is still on the bridge, then fires the moment it's empty", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+    const client2 = await colyseus.connectTo(room);
+
+    client1.send("setScene", { scene: "bonus" });
+    client2.send("setScene", { scene: "bonus" });
+    await room.waitForNextPatch();
+
+    client1.send("bridgeStep", { tileIndex: 10 });
+    await room.waitForNextPatch();
+    assert.strictEqual(client2.state.bridgeTiles[10].bounced, true);
+
+    const originalSafe = Array.from(room.state.bridgeTiles, (t: any) => t.safe);
+
+    // 5th failure tips the count over, but both clients are still reported
+    // as being on the bridge (scene "bonus") -- the reshuffle must NOT
+    // happen yet, unlike the no-scene-set test above.
+    for (let n = 0; n < 5; n++) client1.send("bridgeFail", {});
+    await room.waitForNextPatch();
+    assert.deepStrictEqual(
+      Array.from(client2.state.bridgeTiles, (t: any) => t.safe),
+      originalSafe,
+      "layout must stay put while anyone is still on the bridge",
+    );
+    assert.strictEqual(client2.state.bridgeTiles[10].bounced, true, "progress must survive the deferred reshuffle");
+
+    // client1 leaves the bridge, but client2 is still on it -- still deferred.
+    client1.send("setScene", { scene: "island" });
+    await room.waitForNextPatch();
+    assert.deepStrictEqual(
+      Array.from(client2.state.bridgeTiles, (t: any) => t.safe),
+      originalSafe,
+      "layout must stay put while even one player remains on the bridge",
+    );
+
+    // The last player on the bridge leaves -- the deferred reshuffle fires now.
+    client2.send("setScene", { scene: "island" });
+    await room.waitForNextPatch();
+    assert.strictEqual(client2.state.bridgeTiles[10].bounced, false, "reshuffle finally applies once the bridge is empty");
+    assert.strictEqual(room.state.bridgeTiles[10].safe, true);
+    assert.strictEqual(room.state.bridgeTiles[11].safe, false);
+  });
+
+  it("fires a deferred reshuffle when the last player on the bridge disconnects", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+    const client2 = await colyseus.connectTo(room);
+
+    client1.send("setScene", { scene: "bonus" });
+    await room.waitForNextPatch();
+
+    client1.send("bridgeStep", { tileIndex: 10 });
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.bridgeTiles[10].bounced, true);
+
+    // 5th failure is due while client1 is still the only (and departing)
+    // player on the bridge -- deferred until the leave actually lands.
+    for (let n = 0; n < 5; n++) client1.send("bridgeFail", {});
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.bridgeTiles[10].bounced, true, "still deferred right up to the disconnect");
+
+    // A consented leave (the SDK's default) closes with CloseCode.CONSENTED,
+    // which skips allowReconnection and deletes the player immediately --
+    // see onLeave()'s own branch for that code.
+    await client1.leave();
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.bridgeTiles[10].bounced, false, "onLeave's own maybeReshuffleBridge() call fired it");
+    assert.strictEqual(room.state.bridgeTiles[10].safe, true);
+    assert.strictEqual(room.state.bridgeTiles[11].safe, false);
+  });
+
   it("bridgeStep ignores an out-of-range tileIndex instead of throwing", async () => {
     const room = await colyseus.createRoom<IslandState>("island", {});
     const client1 = await colyseus.connectTo(room);
