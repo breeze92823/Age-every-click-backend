@@ -31,6 +31,12 @@ function dedupeOnline(rows: OnlineRow[], stat: LeaderboardStat): OnlineRow[] {
   return [...byUserId.values(), ...anonymous];
 }
 
+// See loadProgress()'s own comment -- the value sent for tutorialStep when a
+// doc predates that field's existence. Comfortably past client
+// systems/tutorial.js's current STEPS.length (7) so it still reads as
+// "finished" there even if that array grows later.
+const LEGACY_TUTORIAL_DONE_STEP = 1000;
+
 // Cap on the JSON avatar blob (see IslandState.ts PlayerState.avatar). A full
 // equipped set + proportions serialises to a few hundred bytes; 4 KB is
 // generous headroom and still bounds a misbehaving client.
@@ -336,7 +342,14 @@ export class IslandRoom extends Room<{ state: IslandState }> {
         spins: doc.spins ?? 0,
         speedCoil: doc.speedCoil ?? false,
         wheelSpins: doc.wheelSpins ?? 0,
-        tutorialStep: doc.tutorialStep ?? 0,
+        // A doc saved before tutorialStep existed has no field at all here --
+        // NOT the same thing as a brand-new player's implicit 0. Such an
+        // account already has real progress (this doc exists), so defaulting
+        // it to 0 would drop a veteran mid-game straight back into "Click the
+        // Screen!". LEGACY_TUTORIAL_DONE_STEP reads as "finished" to client
+        // systems/tutorial.js (anything >= its STEPS.length does) without
+        // this room needing to know that array's exact length.
+        tutorialStep: typeof doc.tutorialStep === "number" ? doc.tutorialStep : LEGACY_TUTORIAL_DONE_STEP,
         // Time left on the free-spin cooldown, as a duration (see claimFreeSpin).
         freeSpinInMs: Math.max(0, Math.min(FREE_SPIN_INTERVAL_MS, (doc.lastFreeSpinAt ?? 0) + FREE_SPIN_INTERVAL_MS - Date.now())),
       });
