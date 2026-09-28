@@ -456,6 +456,126 @@ describe("testing your Colyseus app", () => {
     });
   });
 
+  it("setScene relays which instance a client is in to every other client", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+    const client2 = await colyseus.connectTo(room);
+
+    // Defaults to "island" before any setScene, same as client
+    // store/useGameStore.js's initial currentScene.
+    assert.strictEqual(client2.state.players.get(client1.sessionId).scene, "island");
+
+    client1.send("setScene", { scene: "bonus" });
+    await room.waitForNextPatch();
+    assert.strictEqual(client2.state.players.get(client1.sessionId).scene, "bonus");
+  });
+
+  it("seeds a shared Impossible Bridge layout every connecting client sees identically", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+    const client2 = await colyseus.connectTo(room);
+
+    assert.strictEqual(room.state.bridgeTiles.length, 12); // BRIDGE_COLUMNS * BRIDGE_LANES
+    // The fixed last column: lane 0 (index 10) is the safe arrow, lane 1
+    // (index 11) the fake cross -- same hardcoded rule the client uses.
+    assert.strictEqual(room.state.bridgeTiles[10].safe, true);
+    assert.strictEqual(room.state.bridgeTiles[11].safe, false);
+    // Both clients' synced copies agree with the server and each other.
+    assert.deepStrictEqual(
+      client1.state.bridgeTiles.map((t: any) => t.safe),
+      client2.state.bridgeTiles.map((t: any) => t.safe),
+    );
+  });
+
+  it("bridgeStep reveals a safe tile for every client, permanently", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+    const client2 = await colyseus.connectTo(room);
+
+    client1.send("bridgeStep", { tileIndex: 10 }); // the fixed-safe arrow tile
+    await room.waitForNextPatch();
+
+    assert.strictEqual(client2.state.bridgeTiles[10].bounced, true);
+    assert.strictEqual(client2.state.bridgeTiles[10].broken, false);
+
+    // A later step by a DIFFERENT client on the same tile doesn't undo it.
+    client2.send("bridgeStep", { tileIndex: 10 });
+    await room.waitForNextPatch();
+    assert.strictEqual(client1.state.bridgeTiles[10].bounced, true);
+  });
+
+  it("bridgeStep springs an unsafe tile for every client, then re-arms it after the shared delay", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+    const client2 = await colyseus.connectTo(room);
+
+    client1.send("bridgeStep", { tileIndex: 11 }); // the fixed-fake cross tile
+    await room.waitForNextPatch();
+    assert.strictEqual(client2.state.bridgeTiles[11].broken, true, "sprung for every client, not just the sender");
+
+    // A re-trigger while already sprung must not restart the re-arm clock.
+    client2.send("bridgeStep", { tileIndex: 11 });
+    await room.waitForNextPatch();
+
+    await new Promise((resolve) => setTimeout(resolve, 1500)); // > BRIDGE_UNSAFE_RESET_DELAY_MS (1300ms)
+    await room.waitForNextPatch();
+    assert.strictEqual(client1.state.bridgeTiles[11].broken, false, "re-armed for every client after the delay");
+  });
+
+  it("reshuffles the shared bridge layout after 5 reported failures, even mid-attempt", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+    const client2 = await colyseus.connectTo(room);
+
+    // Reveal the fixed-safe tile so there's visible "mid-attempt" progress
+    // to lose when the reshuffle hits.
+    client1.send("bridgeStep", { tileIndex: 10 });
+    await room.waitForNextPatch();
+    assert.strictEqual(client2.state.bridgeTiles[10].bounced, true);
+
+    const originalSafe = Array.from(room.state.bridgeTiles, (t: any) => t.safe);
+
+    // 4 failures must NOT reshuffle yet -- it's a group total, not per-fall.
+    for (let n = 0; n < 4; n++) {
+      client1.send("bridgeFail", {});
+    }
+    await room.waitForNextPatch();
+    assert.deepStrictEqual(
+      Array.from(client2.state.bridgeTiles, (t: any) => t.safe),
+      originalSafe,
+      "layout must be untouched before the 5th failure",
+    );
+    assert.strictEqual(client2.state.bridgeTiles[10].bounced, true, "progress must survive under the threshold");
+
+    // The 5th failure (from a DIFFERENT client -- it's a whole-group count,
+    // not per-player) tips it over.
+    client2.send("bridgeFail", {});
+    await room.waitForNextPatch();
+
+    assert.strictEqual(client1.state.bridgeTiles[10].bounced, false, "revealed-safe progress is wiped by a reshuffle");
+    // Still a valid layout: exactly one safe lane per column, fixed last
+    // column unchanged.
+    assert.strictEqual(room.state.bridgeTiles[10].safe, true);
+    assert.strictEqual(room.state.bridgeTiles[11].safe, false);
+    for (let c = 0; c < 5; c++) {
+      const laneSafe = [room.state.bridgeTiles[c * 2].safe, room.state.bridgeTiles[c * 2 + 1].safe];
+      assert.strictEqual(laneSafe.filter(Boolean).length, 1, `column ${c} must have exactly one safe lane`);
+    }
+  });
+
+  it("bridgeStep ignores an out-of-range tileIndex instead of throwing", async () => {
+    const room = await colyseus.createRoom<IslandState>("island", {});
+    const client1 = await colyseus.connectTo(room);
+
+    client1.send("bridgeStep", { tileIndex: 999 });
+    client1.send("bridgeStep", { tileIndex: -1 });
+    client1.send("bridgeStep", {});
+    await room.waitForNextPatch();
+
+    // Nothing crashed and the connection is still alive.
+    assert.strictEqual(room.clients.length, 1);
+  });
+
   it("claimFreeSpin reports 'unavailable' for a guest so the client can fall back to a local timer", async () => {
     __setPlayersForTest(fakePlayersCollection());
     const room = await colyseus.createRoom<IslandState>("island", {});
