@@ -4,7 +4,28 @@ import { ColyseusTestServer, boot } from "@colyseus/testing";
 
 import appConfig from "../src/app.config.js";
 import { IslandState } from "../src/rooms/schema/IslandState.js";
+import { resolveTutorialStep } from "../src/rooms/IslandRoom.js";
 import { __setPlayersForTest, type PlayerDoc } from "../src/db.js";
+
+// A bare-minimum doc for resolveTutorialStep() tests below -- only the
+// fields that function actually reads need real values; everything else is
+// present just to satisfy PlayerDoc's shape.
+function baseDoc(overrides: Partial<PlayerDoc> = {}): PlayerDoc {
+  return {
+    _id: "test",
+    speed: 0,
+    rebirth: 0,
+    coins: 0,
+    ownedHexPads: [0],
+    equippedHexPad: 0,
+    ownedAuras: [],
+    equippedAura: null,
+    ownedAgeMachines: [],
+    version: 1,
+    updatedAt: new Date(),
+    ...overrides,
+  };
+}
 
 // A hand-rolled fake `players` collection -- no MongoDB runs in this test
 // process (see the "degrades to no-op" test below), so refreshLeaderboard()'s
@@ -385,6 +406,54 @@ describe("testing your Colyseus app", () => {
     const reply = client1.waitForMessage("freeSpin");
     client1.send("claimFreeSpin", {});
     assert.strictEqual((await reply).ok, true);
+  });
+
+  // resolveTutorialStep() is what loadProgress() sends down as tutorialStep
+  // on every signed-in join/identify -- tested directly (no room/client
+  // needed) since it's a pure function of the doc.
+  describe("resolveTutorialStep", () => {
+    // A doc saved before tutorialStep existed has no field at all -- NOT the
+    // same thing as a brand-new player's implicit 0. Such an account already
+    // has real progress (the doc exists), so defaulting it to 0 would drop a
+    // veteran mid-game straight back into "Click the Screen!".
+    it("treats a missing field as already finished, not as 0", () => {
+      const doc = baseDoc({ speed: 5000, rebirth: 3 });
+      delete (doc as any).tutorialStep;
+      assert.ok(resolveTutorialStep(doc) >= 7, "a legacy doc must read as onboarding-finished");
+    });
+
+    // The client sends `tutorialStep` back down with every saveProgress the
+    // same as any other field, but a save is never guaranteed to fire the
+    // instant the stat that "proves" a step actually crosses its threshold
+    // (a page close, a crash, a stat edited directly). A stored step must
+    // never undercount what the doc's own stats already prove.
+    it("raises tutorialStep to match a rebirth the stored step doesn't reflect", () => {
+      const doc = baseDoc({ speed: 5000, rebirth: 2, ownedAgeMachines: [0], tutorialStep: 1 });
+      assert.ok(resolveTutorialStep(doc) >= 7, "a rebirthed account must never still show onboarding");
+    });
+
+    it("raises tutorialStep to match Age already past 100 even if never explicitly saved past an early step", () => {
+      const doc = baseDoc({ speed: 500, rebirth: 0, tutorialStep: 0 });
+      assert.strictEqual(resolveTutorialStep(doc), 6, "only the rebirth step should be left");
+    });
+
+    it("raises tutorialStep for an owned Age Machine even below the Age-100 threshold", () => {
+      const doc = baseDoc({ speed: 40, ownedAgeMachines: [0], tutorialStep: 2 });
+      assert.strictEqual(resolveTutorialStep(doc), 5, "owning the Basic Age Machine proves step 4 is done");
+    });
+
+    // Step 3's real gate (finishing an obby) isn't tracked in the doc at
+    // all, so stats alone can prove "at least step 3", never exactly 3 --
+    // a stored step already sitting there must win, not get overridden.
+    it("never regresses a stored tutorialStep that's already ahead of what stats alone can prove", () => {
+      const doc = baseDoc({ speed: 10, coins: 40, tutorialStep: 3 });
+      assert.strictEqual(resolveTutorialStep(doc), 3, "speed 10 alone can't prove step 3's obby was finished, so the stored step wins");
+    });
+
+    it("leaves a genuinely fresh save at step 0", () => {
+      const doc = baseDoc({ tutorialStep: 0 });
+      assert.strictEqual(resolveTutorialStep(doc), 0);
+    });
   });
 
   it("claimFreeSpin reports 'unavailable' for a guest so the client can fall back to a local timer", async () => {

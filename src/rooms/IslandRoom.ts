@@ -37,6 +37,38 @@ function dedupeOnline(rows: OnlineRow[], stat: LeaderboardStat): OnlineRow[] {
 // "finished" there even if that array grows later.
 const LEGACY_TUTORIAL_DONE_STEP = 1000;
 
+// Mirrors client systems/tutorial.js's STEPS thresholds (5/18/100 Age,
+// owning Age Machine index 0, any rebirth) -- kept in sync by comment
+// cross-reference, not a shared import, since the two projects don't share
+// code. loadProgress() below takes the larger of this and the doc's own
+// stored tutorialStep, so a saved step that undercounts the player's ACTUAL
+// progress (a doc saved before tutorialStep was tracked reliably, a manual
+// stat edit, or any other drift between the two) never leaves them looking
+// at a step they've clearly already blown past. Never used to regress a
+// stored step that's already ahead of what these stats alone can prove --
+// step 3's real gate is finishing an obby, which isn't in the doc at all, so
+// this only infers up through "step 3 or later" from speed, not exactly 3.
+function inferMinTutorialStep(doc: PlayerDoc): number {
+  if ((doc.rebirth ?? 0) > 0) return LEGACY_TUTORIAL_DONE_STEP; // past step 6 (first rebirth)
+  const speed = doc.speed ?? 0;
+  if (speed >= 100) return 6; // past step 5 -- only the rebirth step is left
+  if ((doc.ownedAgeMachines ?? []).includes(0)) return 5; // past step 4 -- Basic Age Machine bought
+  if (speed >= 18) return 3; // past step 2
+  if (speed >= 5) return 2; // past step 1
+  if (speed > 0) return 1; // past step 0 -- they've clicked at least once
+  return 0;
+}
+
+// What loadProgress() actually sends down as tutorialStep -- pulled out into
+// its own pure function so test/IslandRoom.test.ts can exercise the legacy-
+// default and stats-override rules directly, without racing the async
+// Mongo-lookup-then-`progress`-message flow a full room/client round trip
+// would require.
+export function resolveTutorialStep(doc: PlayerDoc): number {
+  const stored = typeof doc.tutorialStep === "number" ? doc.tutorialStep : LEGACY_TUTORIAL_DONE_STEP;
+  return Math.max(stored, inferMinTutorialStep(doc));
+}
+
 // Cap on the JSON avatar blob (see IslandState.ts PlayerState.avatar). A full
 // equipped set + proportions serialises to a few hundred bytes; 4 KB is
 // generous headroom and still bounds a misbehaving client.
@@ -330,6 +362,10 @@ export class IslandRoom extends Room<{ state: IslandState }> {
       p.speed = doc.speed ?? 0;
       p.coins = doc.coins ?? 0;
       p.rebirth = doc.rebirth ?? 0;
+      // See resolveTutorialStep()'s and inferMinTutorialStep()'s own comments
+      // -- corrects for a doc predating tutorialStep entirely, and for a
+      // stored step that undercounts progress the doc's own stats prove.
+      const tutorialStep = resolveTutorialStep(doc);
       client.send("progress", {
         speed: doc.speed ?? 0,
         rebirth: doc.rebirth ?? 0,
@@ -342,14 +378,7 @@ export class IslandRoom extends Room<{ state: IslandState }> {
         spins: doc.spins ?? 0,
         speedCoil: doc.speedCoil ?? false,
         wheelSpins: doc.wheelSpins ?? 0,
-        // A doc saved before tutorialStep existed has no field at all here --
-        // NOT the same thing as a brand-new player's implicit 0. Such an
-        // account already has real progress (this doc exists), so defaulting
-        // it to 0 would drop a veteran mid-game straight back into "Click the
-        // Screen!". LEGACY_TUTORIAL_DONE_STEP reads as "finished" to client
-        // systems/tutorial.js (anything >= its STEPS.length does) without
-        // this room needing to know that array's exact length.
-        tutorialStep: typeof doc.tutorialStep === "number" ? doc.tutorialStep : LEGACY_TUTORIAL_DONE_STEP,
+        tutorialStep,
         // Time left on the free-spin cooldown, as a duration (see claimFreeSpin).
         freeSpinInMs: Math.max(0, Math.min(FREE_SPIN_INTERVAL_MS, (doc.lastFreeSpinAt ?? 0) + FREE_SPIN_INTERVAL_MS - Date.now())),
       });
