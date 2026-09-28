@@ -35,6 +35,12 @@ export interface PlayerDoc {
   // Server epoch ms of the last free-spin claim. Only ever written by
   // IslandRoom.ts's `claimFreeSpin`, never by saveProgress.
   lastFreeSpinAt?: number;
+  // Client systems/tutorial.js's onboarding progress: index into its STEPS
+  // array, or STEPS.length once finished. Older docs simply lack it, which
+  // loadProgress below reads the same as 0 -- exactly what a doc predating
+  // this field would actually mean, since onboarding didn't have anywhere
+  // durable to resume from yet.
+  tutorialStep?: number;
   version: number;
   updatedAt: Date;
 }
