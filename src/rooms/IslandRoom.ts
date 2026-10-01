@@ -1,6 +1,16 @@
 import { Room, Client, CloseCode } from "colyseus";
-import { IslandState, PlayerState } from "./schema/IslandState.js";
-import { LEADERBOARD_REFRESH_MS, LEADERBOARD_QUERY_LIMIT, FREE_SPIN_INTERVAL_MS, SPINS_MAX } from "../constants.js";
+import type { Delayed } from "@colyseus/timer";
+import { IslandState, PlayerState, BridgeTileState } from "./schema/IslandState.js";
+import {
+  LEADERBOARD_REFRESH_MS,
+  LEADERBOARD_QUERY_LIMIT,
+  FREE_SPIN_INTERVAL_MS,
+  SPINS_MAX,
+  BRIDGE_COLUMNS,
+  BRIDGE_LANES,
+  BRIDGE_UNSAFE_RESET_DELAY_MS,
+  BRIDGE_RESHUFFLE_AFTER_FAILS,
+} from "../constants.js";
 import { getPlayers, type PlayerDoc } from "../db.js";
 
 // The 3 stats client store/useGameStore.js tracks and an in-world
@@ -78,6 +88,28 @@ function sanitizeAvatar(raw: unknown): string {
   return typeof raw === "string" && raw.length <= AVATAR_MAX_LEN ? raw : "";
 }
 
+// Builds the room's one shared Impossible Bridge layout -- see
+// BridgeTileState's own comment for why this happens exactly once, at room
+// startup, never per-player or per-attempt. Column/lane order matches
+// client systems/bonusBridge.js's own tiles.push() loop exactly (index =
+// column * BRIDGE_LANES + lane), so client index i and this array's index i
+// are always the same physical tile. The last column is the fixed
+// green-arrow (lane 0) / red-X (lane 1) pair, same fixed rule the client
+// itself hardcodes.
+function buildBridgeLayout(): InstanceType<typeof BridgeTileState>[] {
+  const out: InstanceType<typeof BridgeTileState>[] = [];
+  for (let c = 0; c < BRIDGE_COLUMNS; c++) {
+    const last = c === BRIDGE_COLUMNS - 1;
+    const safeLane = last ? 0 : Math.random() < 0.5 ? 0 : 1;
+    for (let lane = 0; lane < BRIDGE_LANES; lane++) {
+      const t = new BridgeTileState();
+      t.safe = lane === safeLane;
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 // Generous cap on an owned-tier list (client data/hexPowerPad.js /
 // data/aura.js / data/island.js AGE_MACHINES each ship well under this many
 // tiers today).
@@ -142,6 +174,25 @@ export class IslandRoom extends Room<{ state: IslandState }> {
   // userIds with a `claimFreeSpin` read-check-write already in flight, so a
   // double-click can't pass the cooldown check twice before the first write lands.
   private claimingFreeSpin = new Set<string>();
+
+  // Impossible Bridge shared puzzle bookkeeping -- deliberately NOT part of
+  // IslandState, same reasoning as userIds above: neither has any reason to
+  // be broadcast, they only drive this room's own logic.
+  // tileIndex -> its pending re-arm Delayed, so reshuffleBridge() can cancel
+  // one that's still counting down instead of leaving it to later fire and
+  // stomp a tile a fresh layout already reset.
+  private bridgeBreakTimers = new Map<number, Delayed>();
+  // Total falls/timeouts reported since the last reshuffle (or room start) --
+  // see BRIDGE_RESHUFFLE_AFTER_FAILS's own comment.
+  private bridgeFailCount = 0;
+  // Set once BRIDGE_RESHUFFLE_AFTER_FAILS has been reached but at least one
+  // player was still on the bridge at that moment -- reshuffling out from
+  // under someone mid-crossing would flip tiles they've already relied on
+  // (or are currently standing on) with no warning. maybeReshuffleBridge()
+  // (called from setScene and onLeave, wherever the "who's on the bridge"
+  // set can shrink) actually performs the deferred reshuffle the instant
+  // nobody's left on it.
+  private bridgeReshuffleDue = false;
 
   messages = {
     // Throttled client-side -- not sent every physics frame.
@@ -264,7 +315,110 @@ export class IslandRoom extends Room<{ state: IslandState }> {
       if (typeof msg?.username === "string") p.username = msg.username.slice(0, 64);
       this.setUserId(client, p, typeof msg?.userId === "string" ? msg.userId : "");
     },
+    // Which scene/instance this connection is currently in (client
+    // store/useGameStore.js's currentScene) -- see PlayerState.scene's own
+    // comment. Sent once on connect and again on every scene change, not per
+    // frame -- same human-speed cadence as setAvatar/identify.
+    setScene: (client: Client, msg: { scene?: string }) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+      if (typeof msg?.scene === "string") p.scene = msg.scene.slice(0, 32);
+      // A scene change is the common way the bridge empties out (finishing,
+      // falling back to the island, or just leaving) -- see
+      // maybeReshuffleBridge()'s own comment for why this can't just
+      // reshuffle unconditionally on every change.
+      this.maybeReshuffleBridge();
+    },
+    // A client's foot lands on Impossible Bridge tile `tileIndex` (client
+    // systems/bonusBridge.js's stepBonusBridge()). The room is the sole
+    // authority on whether that lane is actually the safe one
+    // (BridgeTileState.safe, set once in buildBridgeLayout()) -- this
+    // message only ever reports "something touched down here", never the
+    // outcome; every client (including the sender) learns the outcome back
+    // over the synced state. No position validation, same trust model as
+    // every other message here -- a forged index can only ever flip a
+    // shared cosmetic/collision tile, it has no path to Mongo or another
+    // player's saved progress.
+    bridgeStep: (client: Client, msg: { tileIndex?: number }) => {
+      const i = msg?.tileIndex;
+      if (!Number.isInteger(i) || i < 0 || i >= this.state.bridgeTiles.length) return;
+      const index = i as number;
+      const t = this.state.bridgeTiles[index];
+      if (t.safe) {
+        t.bounced = true; // one-shot -- see BridgeTileState's own comment, never reset
+        return;
+      }
+      if (t.broken) return; // already sprung -- a re-trigger mid-trap must not restart the re-arm clock
+      t.broken = true;
+      const timer = this.clock.setTimeout(() => {
+        t.broken = false;
+        this.bridgeBreakTimers.delete(index);
+      }, BRIDGE_UNSAFE_RESET_DELAY_MS);
+      this.bridgeBreakTimers.set(index, timer);
+    },
+    // A client fell off or timed out on the Impossible Bridge (client
+    // systems/bonusBridge.js's respawnAtStart()) -- purely a "someone
+    // failed" signal, no need to know who. Once BRIDGE_RESHUFFLE_AFTER_FAILS
+    // failures have piled up across the whole group since the last
+    // reshuffle, a brand new shared layout is due for everyone -- see
+    // BRIDGE_RESHUFFLE_AFTER_FAILS's own comment for why this can't just be
+    // "reset on any one fall", and bridgeReshuffleDue's for why it may not
+    // actually reroll the instant this fires.
+    bridgeFail: (client: Client) => {
+      this.bridgeFailCount += 1;
+      if (this.bridgeFailCount < BRIDGE_RESHUFFLE_AFTER_FAILS) return;
+      this.bridgeFailCount = 0;
+      // Don't reroll out from under whoever's still on the bridge right now
+      // (almost always including the very client that just reported this
+      // fail, since failing requires being there) -- flag it and let
+      // maybeReshuffleBridge() fire the instant the bridge is actually empty.
+      this.bridgeReshuffleDue = true;
+      this.maybeReshuffleBridge();
+    },
   };
+
+  // Whether any currently-connected player is on the Impossible Bridge right
+  // now (client store/useGameStore.js's currentScene === 'bonus', relayed via
+  // setScene). The bridge is a single shared instance with no finer-grained
+  // "standing on tile X" tracking, so this is the room's whole notion of
+  // "someone's mid-attempt" for reshuffleBridge()'s sake.
+  private anyPlayerOnBridge(): boolean {
+    let found = false;
+    this.state.players.forEach((p) => {
+      if (p.scene === "bonus") found = true;
+    });
+    return found;
+  }
+
+  // Performs the reshuffle a bridgeFail deferred (bridgeReshuffleDue), but
+  // only once nobody's left on the bridge to have it change under them --
+  // see bridgeReshuffleDue's own comment. A cheap no-op call otherwise, so
+  // every place the "who's on the bridge" set can shrink (setScene, onLeave)
+  // can just call this unconditionally rather than duplicate the check.
+  private maybeReshuffleBridge() {
+    if (!this.bridgeReshuffleDue || this.anyPlayerOnBridge()) return;
+    this.bridgeReshuffleDue = false;
+    this.reshuffleBridge();
+  }
+
+  // Rerolls the shared Impossible Bridge layout in place -- mutates the
+  // existing BridgeTileState instances (rather than replacing the array) so
+  // client index i stays the same physical tile across a reshuffle, and
+  // resets every tile's live state too, same as a fresh room start. Only
+  // ever called via maybeReshuffleBridge() once the bridge is confirmed
+  // empty, so there's no one mid-attempt left to have this change under
+  // them. Cancels any pending re-arm timer first so it can't later fire and
+  // flip a tile the fresh layout already set back to false.
+  private reshuffleBridge() {
+    for (const timer of this.bridgeBreakTimers.values()) timer.clear();
+    this.bridgeBreakTimers.clear();
+    const fresh = buildBridgeLayout();
+    this.state.bridgeTiles.forEach((t, index) => {
+      t.safe = fresh[index].safe;
+      t.broken = false;
+      t.bounced = false;
+    });
+  }
 
   // Kicks off the periodic global-leaderboard broadcast (see
   // refreshLeaderboard() below). Runs once immediately -- a fresh room
@@ -278,6 +432,9 @@ export class IslandRoom extends Room<{ state: IslandState }> {
     this.clock.setInterval(() => {
       void this.refreshLeaderboard();
     }, LEADERBOARD_REFRESH_MS);
+    // The Impossible Bridge's one shared layout, built once for this room's
+    // whole lifetime -- see buildBridgeLayout()'s own comment.
+    for (const t of buildBridgeLayout()) this.state.bridgeTiles.push(t);
   }
 
   onJoin(client: Client, options?: { username?: string; avatar?: string; userId?: string }) {
@@ -400,6 +557,9 @@ export class IslandRoom extends Room<{ state: IslandState }> {
     if (code === CloseCode.CONSENTED) {
       this.state.players.delete(client.sessionId);
       this.userIds.delete(client.sessionId);
+      // A disconnecting player who was on the bridge just freed it -- same
+      // deferred-reshuffle check as setScene, see maybeReshuffleBridge().
+      this.maybeReshuffleBridge();
       return;
     }
     try {
@@ -409,6 +569,7 @@ export class IslandRoom extends Room<{ state: IslandState }> {
     } catch {
       this.state.players.delete(client.sessionId);
       this.userIds.delete(client.sessionId);
+      this.maybeReshuffleBridge();
     }
   }
 
